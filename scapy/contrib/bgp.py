@@ -414,6 +414,7 @@ subsequent_afis = {
     70: "BGP EVPNs",  # RFC 7432
     71: "BGP-LS",  # RFC 7752
     72: "BGP-LS-VPN",  # RFC 7752
+    85: "BGP-MUP", # draft-mpmz-bess-mup-safi-00
     128: "MPLS-labeled VPN address",  # RFC 4364
     129: "Multicast for BGP/MPLS IP Virtual Private Networks (VPNs)",  # RFC 6514  # noqa: E501
     132: "Route Target constraint",  # RFC 4684
@@ -1390,6 +1391,7 @@ _ext_comm_types = {
     0x06: "EVPN",  # RFC 7153
     0x07: "Unassigned",
     0x08: "Flow spec redirect/mirror to IP next-hop",  # draft-simpson-idr-flowspec-redirect  # noqa: E501
+    0x0c: "Transitive MUP Extended Community",
 
     # BGP Non-Transitive Extended Community Types
     0x40: "Non-Transitive Two-Octet AS-Specific Extended Community",  # RFC 7153  # noqa: E501
@@ -1684,12 +1686,24 @@ class BGPPAExtCommTrafficMarking(Packet):
         BitEnumField("dscp", 48, 48, _ext_comm_traffic_action_fields)
     ]
 
+class BGPPAExtCommMUPDirSegId(Packet):
+    """
+    Packet handling the MUP Direct Segment Identifier Extended Community.
+    References: draft-mpmz-bess-mup-safi-00
+    """
+
+    name = "MUP Direct Segment Identifier Extended Community"
+    fields_desc = [
+        ShortField("seg_id_2", 0),
+        IntField("seg_id_4", 0)
+    ]
 
 _ext_high_low_dict = {
     BGPPAExtCommTwoOctetASSpecific: (0x00, 0x00),
     BGPPAExtCommIPv4AddressSpecific: (0x01, 0x00),
     BGPPAExtCommFourOctetASSpecific: (0x02, 0x00),
     BGPPAExtCommOpaque: (0x03, 0x00),
+    BGPPAExtCommMUPDirSegId: (0x0c, 0x00),
     BGPPAExtCommTrafficRate: (0x80, 0x06),
     BGPPAExtCommTrafficAction: (0x80, 0x07),
     BGPPAExtCommRedirectAS2Byte: (0x80, 0x08),
@@ -2574,6 +2588,300 @@ class BGPRouteRefresh(BGP):
         )
     ]
 
+_route_distinguisher_type = {
+    0: "Type 0",
+    1: "Type 1",
+    2: "Type 2",
+}
+
+class BGPRouteDistinguisher(Field):
+    """
+    Route Distinguisher Field
+    """
+
+    def h2i(self, pkt, h):
+        ad, an = re.split(":", h)
+        an = int(an)
+        rd_type = 0
+        dot = len(re.split("\.", ad))
+        if (dot==1):
+            if (ad[-1:] == 'L'):
+                ad = int(ad[:-1])
+                rd_type = 2
+            else:
+                ad = int(ad)
+                if (ad>65535):
+                    rd_type = 2
+        elif (dot==2):
+            upper, lower = re.split("\.", ad)
+            ad = (int(upper) << 16) + int(lower)
+            rd_type = 2
+        else:
+            rd_type = 1
+
+        return (rd_type, [ad, an])
+
+    def i2h(self, pkt, i):
+        rd_type, [ad, an] = i
+        if (rd_type == 0):
+            return str(ad) + ":" + str(an)
+        elif (rd_type == 1):
+            return ad + ":" + str(an)
+        else:
+            return str(ad) + "L:" + str(an)
+
+    def i2repr(self, pkt, i):
+        return self.i2h(pkt, i)
+
+    def i2len(self, pkt, i):
+        return 4
+
+    def i2m(self, pkt, i):
+        rd_type, [ad, an] = i
+        if (rd_type == 0):
+            return struct.pack(">H", rd_type) + struct.pack(">H", ad) + struct.pack(">I", an)
+        elif (rd_type == 1):
+            ad = socket.inet_aton(ad)
+            return struct.pack(">H", rd_type) + ad + struct.pack(">H", an)
+        else:
+            return struct.pack(">H", rd_type) + struct.pack(">I", ad) + struct.pack(">H", an)
+
+    def addfield(self, pkt, s, val):
+            return s + self.i2m(pkt, val)
+
+    def getfield(self, pkt, s):
+            return self.m2i(pkt, s)
+
+    def m2i(self, pkt, m):
+        rd_type = struct.unpack(">H", m[0:2])
+        if (rd_type == 0):
+            ad = struct.unpack(">H", m[2:4])
+            an = struct.unpack(">I", m[4:8])
+        elif (rd_type == 1):
+            ad = struct.unpack(">I", m[2:6])
+            ad = socket.inet_ntoa(ad)
+            an = struct.unpack(">H", m[6:8])
+        else:
+            ad = struct.unpack(">I", m[2:6])
+            an = struct.unpack(">H", m[6:8])
+        return rd_type, ad, an
+
+class MUP3GPP5GEndpointIPv4Field(Field):
+    """
+    BGP-MUP 3gpp-5g specific endpoint field for IPv4
+    """
+
+    def mask2eplen(self, mask):
+        """Get the Endpoint field mask length (in bytes)."""
+        return (mask + 7) // 8
+
+    def h2i(self, pkt, h):
+        """x.x.x.x:z/y to "internal" representation."""
+        endpoint, mask = re.split("/", h)
+        ip, teid = endpoint.rsplit(':',1)
+        return int(mask), [ip, int(teid)]
+
+    def i2h(self, pkt, i):
+        """"Internal" representation to "human" representation
+        (x.x.x.x:z/y)."""
+        mask, [ip, teid] = i
+        if (teid > 0):
+            return ip + ":" + str(teid) + "/" + str(mask)
+        else:
+            return ip + "/" + str(mask)
+
+    def i2repr(self, pkt, i):
+        return self.i2h(pkt, i)
+
+    def i2len(self, pkt, i):
+        mask, _ = i
+        return self.mask2eplen(mask) + 1
+
+    def i2m(self, pkt, i):
+        """"Internal" (IP and TEID as bytes, mask as int) to "machine"
+        representation."""
+        mask, [ip, teid] = i
+        ip = socket.inet_aton(ip)
+        return struct.pack(">B", mask) + (ip + struct.pack(">I", teid))[:self.mask2eplen(mask)]  # noqa: E501
+
+    def addfield(self, pkt, s, val):
+        return s + self.i2m(pkt, val)
+
+    def getfield(self, pkt, s):
+        length = self.mask2eplen(orb(s[0])) + 1
+        return s[length:], self.m2i(pkt, s[:length])
+
+    def m2i(self, pkt, m):
+        mask = orb(m[0])
+        mask2eplen_res = self.mask2eplen(mask)
+        ep = b"".join(m[i + 1:i + 2] if i < mask2eplen_res else b"\x00" for i in range(8))  # noqa: E501
+        ip = ep[0:4]
+        teid = ep[4:8]
+        return (mask, [socket.inet_ntoa(ip), teid])
+
+class MUP3GPP5GEndpointIPv6Field(Field):
+    """
+    BGP-MUP 3gpp-5g specific endpoint field for IPv6
+    """
+
+    def mask2eplen(self, mask):
+        return (mask + 7) // 8
+
+    def h2i(self, pkt, h):
+        endpoint, mask = re.split("/", h)
+        ip, teid = endpoint.rsplit(':',1)
+        return int(mask), [ip, int(teid)]
+
+    def i2h(self, pkt, i):
+        mask, [ip, teid] = i
+        if (teid > 0):
+            return ip + ":" + str(teid) + "/" + str(mask)
+        else:
+            return ip + "/" + str(mask)
+
+    def i2repr(self, pkt, i):
+        return self.i2h(pkt, i)
+
+    def i2len(self, pkt, i):
+        mask, _ = i
+        return self.mask2eplen(mask) + 1
+
+    def i2m(self, pkt, i):
+        mask, [ip, teid] = i
+        ip = pton_ntop.inet_pton(socket.AF_INET6, ip)
+        return struct.pack(">B", mask) + (ip + struct.pack(">I", teid))[:self.mask2eplen(mask)]  # noqa: E501
+
+    def addfield(self, pkt, s, val):
+        return s + self.i2m(pkt, val)
+
+    def getfield(self, pkt, s):
+        length = self.mask2eplen(orb(s[0])) + 1
+        return s[length:], self.m2i(pkt, s[:length])
+
+    def m2i(self, pkt, m):
+        mask = orb(m[0])
+        mask2eplen_res = self.mask2eplen(mask)
+        ep = b"".join(m[i + 1:i + 2] if i < mask2eplen_res else b"\x00" for i in range(16))  # noqa: E501
+        ip = ep[0:16]
+        teid = ep[16:20]
+        return (mask, [pton_ntop.inet_ntop(socket.AF_INET6, ip), teid])
+
+class BGPNLRI_MUP_ISDRouteIPv4(Packet):
+    name = "MUP Interwork Segment Discovery route"
+    fields_desc = [
+        BGPRouteDistinguisher("rd", "1:1"),
+        BGPFieldIPv4("prefix", "0.0.0.0/0"),
+    ]
+
+class BGPNLRI_MUP_ISDRouteIPv6(Packet):
+    name = "MUP Interwork Segment Discovery route"
+    fields_desc = [
+        BGPRouteDistinguisher("rd", "1:1"),
+        BGPFieldIPv6("prefix", "::/0"),
+    ]
+
+class BGPNLRI_MUP_DSDRouteIPv4(Packet):
+    name = "MUP Direct Segment Discovery route"
+    fields_desc = [
+        BGPRouteDistinguisher("rd", "0:0"),
+        IPField("address", "0.0.0.0"),
+    ]
+
+class BGPNLRI_MUP_DSDRouteIPv6(Packet):
+    name = "MUP Direct Segment Discovery route"
+    fields_desc = [
+        BGPRouteDistinguisher("rd", "0:0"),
+        IP6Field("address", "::"),
+    ]
+
+class BGPNLRI_MUP_Type1STRoute3GPP5GIPv4(Packet):
+    name = "MUP Type 1 Session Transformed (ST) route"
+    fields_desc = [
+        BGPRouteDistinguisher("rd", "0:0"),
+        BGPFieldIPv4("prefix", "0.0.0.0/0"),
+        IntField("teid", 0),
+        ByteField("qfi", 0),
+        BGPFieldIPv4("endpoint_address", "0.0.0.0/0"),
+    ]
+
+class BGPNLRI_MUP_Type1STRoute3GPP5GIPv6(Packet):
+    name = "MUP Type 1 Session Transformed (ST) route"
+    fields_desc = [
+        BGPRouteDistinguisher("rd", "0:0"),
+        BGPFieldIPv6("prefix", "::/0"),
+        IntField("teid", 0),
+        ByteField("qfi", 0),
+        BGPFieldIPv6("endpoint_address", "::/0"),
+    ]
+
+class BGPNLRI_MUP_Type2STRoute3GPP5GIPv4(Packet):
+    name = "MUP Type 2 Session Transformed (ST) route"
+    fields_desc = [
+        BGPRouteDistinguisher("rd", "0:0"),
+        MUP3GPP5GEndpointIPv4Field("endpoint", "0.0.0.0:0/0"),
+    ]
+
+class BGPNLRI_MUP_Type2STRoute3GPP5GIPv6(Packet):
+    name = "MUP Type 2 Session Transformed (ST) route"
+    fields_desc = [
+        BGPRouteDistinguisher("rd", "0:0"),
+        MUP3GPP5GEndpointIPv6Field("endpoint", ":::0/0"),
+    ]
+
+_mup_architecture_type = {
+    1: "3gpp-5g",
+}
+
+_mup_route_type = {
+    1: "Interwork Segment Discovery route",
+    2: "Direct Segment Discovery route",
+    3: "Type 1 Session Transformed (ST) route",
+    4: "Type 2 Session Transformed (ST) route",
+}
+
+_mup_route_objects = {
+    0x01: "BGPNLRI_MUP_ISDRoute",
+    0x02: "BGPNLRI_MUP_DSDRoute",
+    0x03: "BGPNLRI_MUP_Type1STRoute",
+    0x04: "BGPNLRI_MUP_Type2STRoute",
+}
+
+class _MUPRtSpecPacketField(PacketField):
+    """
+    PacketField handling route-type specific value parts.
+    """
+
+    def m2i(self, pkt, m):
+        ret = None
+        type_code = pkt.type_code
+
+        # Reserved
+        if type_code == 0:
+            ret = conf.raw_layer(m)
+        # Unassigned
+        elif (type_code >= 5):
+            ret = conf.raw_layer(m)
+        # Known routes
+        else:
+            ret = _get_cls(
+                _mup_route_objects.get(type_code, conf.raw_layer))(m)
+
+        return ret
+
+class BGPNLRI_MUP(Packet):
+    """
+    Packet handling BGP-MUP NLRI fields.
+    """
+    name = "BGP MUP"
+    fields_desc = [
+            ByteEnumField("architecture_type", 1, _mup_architecture_type),
+            ShortEnumField("route_type", 1, _mup_route_type),
+            FieldLenField("length", None, length_of="route_type_specific", fmt="!B"),
+            _MUPRtSpecPacketField("route_type_specific", None, Packet),
+    ]
+
+    def default_payload_class(self, payload):
+        return conf.padding_layer
 
 #
 # Layer bindings
